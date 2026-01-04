@@ -1,254 +1,379 @@
-import asyncio
-import json
-import os
-import random
-import time
-import re
-import aiofiles
-from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.enums import ParseMode
-from pyrogram.errors import FloodWait, UsernameNotOccupied, PeerIdInvalid
-from config import BOT_TOKEN, API_ID, API_HASH, OWNER_ID, SESSION_DIR, SESSIONS_FILE, SUDOS_FILE
+"""
+🔥 PremiumKillerBot - Complete Telegram Session Creator + 2FA Support
+📱 Phone → OTP → 2FA → Session Ready!
+💎 Owner/Sudo Only - Unlimited Sessions
+"""
 
-app = Client("premium_killer", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+import os
+import asyncio
+import time
+import json
+import logging
+from pyrogram import Client, filters, errors
+from pyrogram.types import Message
+from pyrogram.enums import ParseMode
+from pyrogram.errors import SessionPasswordNeeded, PhoneCodeInvalid
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 📋 CONFIG - EDIT THESE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+API_ID = 12345678  # Your API ID
+API_HASH = "your_api_hash_here"  # Your API Hash
+OWNER_ID = 123456789  # Your User ID
+SESSION_DIR = "sessions"  # Folder to save sessions
+
+# SUDO USERS (Multiple owners)
+SUDOS = [123456789, 987654321]  # Add more IDs
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🤖 PremiumKillerBot Class
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class PremiumKillerBot:
     def __init__(self):
+        self.app = None
         self.sessions = {}
-        self.sudos = set()
-        self.active_attacks = {}
-        os.makedirs(SESSION_DIR, exist_ok=True)
-        self.load_data()
-    
-    async def load_data(self):
-        if os.path.exists(SESSIONS_FILE):
-            async with aiofiles.open(SESSIONS_FILE, 'r') as f:
-                data = json.loads(await f.read())
-                self.sessions = data.get('sessions', {})
+        self.pending_sessions = {}  # phone → data
+        self.waiting_2fa = {}       # phone → user_id
         
-        if os.path.exists(SUDOS_FILE):
-            async with aiofiles.open(SUDOS_FILE, 'r') as f:
-                data = json.loads(await f.read())
-                self.sudos = set(data.get('sudos', []))
+        # Create sessions dir
+        os.makedirs(SESSION_DIR, exist_ok=True)
+        self.load_sessions()
+    
+    async def start(self):
+        self.app = Client("killer_bot", api_id=API_ID, api_hash=API_HASH)
+        
+        # Register handlers
+        self.app.on_message(filters.command("start") & filters.private)(self.start_handler)
+        self.app.on_message(filters.command("sessions") & filters.private)(self.sessions_handler)
+        self.app.on_message(filters.command("stats") & filters.private)(self.stats_handler)
+        self.app.on_message(filters.command("clear") & filters.private)(self.clear_handler)
+        
+        # Session creation handlers
+        self.app.on_message(filters.private & filters.regex(r'^\+[1-9]\d{1,14}$'))(self.phone_handler)
+        self.app.on_message(filters.private & filters.text & filters.regex(r'^\d{5,6}$') & ~filters.command("start"))(self.otp_handler)
+        self.app.on_message(filters.private & filters.text & ~filters.regex(r'^\d{5,6}$') & ~filters.regex(r'^\+[1-9]\d{1,14}$') & ~filters.command("start"))(self.password_handler)
+        
+        await self.app.start()
+        print("🚀 PremiumKillerBot Started!")
+        await asyncio.Event().wait()  # Keep alive
+    
+    def load_sessions(self):
+        """Load existing sessions"""
+        try:
+            if os.path.exists("sessions.json"):
+                with open("sessions.json", "r") as f:
+                    self.sessions = json.load(f)
+                print(f"📊 Loaded {len(self.sessions)} sessions")
+        except:
+            self.sessions = {}
     
     async def save_sessions(self):
-        async with aiofiles.open(SESSIONS_FILE, 'w') as f:
-            await f.write(json.dumps({'sessions': self.sessions}, indent=2))
-    
-    async def save_sudos(self):
-        async with aiofiles.open(SUDOS_FILE, 'w') as f:
-            await f.write(json.dumps({'sudos': list(self.sudos)}, indent=2))
+        """Save sessions to JSON"""
+        try:
+            with open("sessions.json", "w") as f:
+                json.dump(self.sessions, f, indent=2)
+        except Exception as e:
+            print(f"❌ Save error: {e}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🎯 HANDLERS
+# ═══════════════════════════════════════════════════════════════════════════════
 
 bot = PremiumKillerBot()
 
-def get_main_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📱 Add Session", callback_data="add_session")],
-        [InlineKeyboardButton("👤 Username Ban", callback_data="ban_username"),
-         InlineKeyboardButton("🆔 ID Ban", callback_data="ban_id")],
-        [InlineKeyboardButton("📢 Channel Delete", callback_data="delete_channel"),
-         InlineKeyboardButton("👥 Group Delete", callback_data="delete_group")],
-        [InlineKeyboardButton("💎 Premium Killer", callback_data="premium_kill"),
-         InlineKeyboardButton("📊 Stats", callback_data="stats")]
-    ])
+@bot.app.on_message(filters.command("start") & filters.private)
+async def start_handler(client: Client, message: Message):
+    user_id = message.from_user.id
+    if user_id not in (OWNER_ID, *SUDOS):
+        return await message.reply("🔒 **Owner Only!**")
+    
+    await message.reply(
+        "🚀 **PremiumKillerBot Active!**\n\n"
+        "📱 **Create Session:**\n"
+        "`+919876543210`\n\n"
+        "🔑 **Flow:**\n"
+        "1. Phone → 2. OTP → 3. 2FA (if enabled)\n\n"
+        "📊 **Commands:**\n"
+        "`/sessions` - List all\n"
+        "`/stats` - Stats\n"
+        "`/clear` - Delete all",
+        parse_mode=ParseMode.MARKDOWN
+    )
 
-# 🔥 ENHANCED NOTIFICATION SYSTEM
-async def send_notification(chat_id, title, status, details=""):
-    emoji = {"start": "🚀", "progress": "⚡", "success": "✅", "premium": "💎", "frozen": "❄️", "banned": "🚫", "deleted": "💥"}
-    msg = f"{emoji.get(status, 'ℹ️')} **{title}**\n\n{details}\n\n"
-    await app.send_message(chat_id, msg, parse_mode=ParseMode.MARKDOWN)
+@bot.app.on_message(filters.command("sessions") & filters.private)
+async def sessions_handler(client: Client, message: Message):
+    user_id = message.from_user.id
+    if user_id not in (OWNER_ID, *SUDOS):
+        return
+    
+    if not bot.sessions:
+        return await message.reply("📭 **No sessions!**")
+    
+    text = "📱 **Active Sessions:**\n\n"
+    premium_count = 0
+    total = len(bot.sessions)
+    
+    for name, data in bot.sessions.items():
+        status = "💎 PREMIUM" if data.get('is_premium') else "📱 Normal"
+        if data.get('is_premium'):
+            premium_count += 1
+        text += f"• `{data['phone']}` - {status}\n"
+    
+    text += f"\n📊 **{premium_count}/{total} Premium**"
+    await message.reply(text, parse_mode=ParseMode.MARKDOWN)
 
-# 📱 SESSION CREATOR
-async def create_session(phone: str, chat_id: int) -> bool:
+@bot.app.on_message(filters.command("stats") & filters.private)
+async def stats_handler(client: Client, message: Message):
+    user_id = message.from_user.id
+    if user_id not in (OWNER_ID, *SUDOS):
+        return
+    
+    total = len(bot.sessions)
+    premium = sum(1 for s in bot.sessions.values() if s.get('is_premium'))
+    normal = total - premium
+    
+    text = f"""📊 **Bot Stats:**
+📱 **Total:** `{total}`
+💎 **Premium:** `{premium}`
+📱 **Normal:** `{normal}`
+"""
+    await message.reply(text, parse_mode=ParseMode.MARKDOWN)
+
+@bot.app.on_message(filters.command("clear") & filters.private)
+async def clear_handler(client: Client, message: Message):
+    user_id = message.from_user.id
+    if user_id not in (OWNER_ID, *SUDOS):
+        return
+    
+    confirm = message.text.split(" ")[1] if len(message.text.split()) > 1 else None
+    
+    if confirm == "yes":
+        # Delete session files
+        for session_name in list(bot.sessions.keys()):
+            path = bot.sessions[session_name]['path']
+            if os.path.exists(path + ".session"):
+                os.remove(path + ".session")
+        
+        bot.sessions.clear()
+        await bot.save_sessions()
+        await message.reply("🗑️ **All sessions cleared!**")
+    else:
+        await message.reply("⚠️ **Confirm:** `/clear yes`")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🔥 SESSION CREATION - 3 STEP (Phone → OTP → 2FA)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@bot.app.on_message(filters.private & filters.regex(r'^\+[1-9]\d{1,14}$'))
+async def phone_handler(client: Client, message: Message):
+    phone = message.text.strip()
+    user_id = message.from_user.id
+    
+    if user_id not in (OWNER_ID, *SUDOS):
+        return await message.reply("🔒 **Owner/Sudo only!**")
+    
+    # Cleanup old sessions for this user
+    to_delete = []
+    for p, data in list(bot.pending_sessions.items()):
+        if data['user_id'] == user_id:
+            to_delete.append(p)
+    for p in to_delete:
+        del bot.pending_sessions[p]
+    
     session_name = f"session_{int(time.time())}"
+    bot.pending_sessions[phone] = {
+        'user_id': user_id,
+        'session_name': session_name,
+        'time': time.time()
+    }
+    
+    await message.reply(
+        f"📱 **Phone Registered:** `{phone}`\n\n"
+        f"🔑 **Step 1/3 - Send OTP:**\n"
+        "`12345` or `123456`\n\n"
+        f"🔐 **Step 2/3** - 2FA Password (if enabled)\n"
+        f"⏰ **Timeout:** 3 minutes",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+@bot.app.on_message(filters.private & filters.text & filters.regex(r'^\d{5,6}$') & ~filters.command("start"))
+async def otp_handler(client: Client, message: Message):
+    code = message.text.strip()
+    user_id = message.from_user.id
+    
+    # Find pending session
+    pending_phone = None
+    session_data = None
+    for phone, data in list(bot.pending_sessions.items()):
+        if data['user_id'] == user_id and (time.time() - data['time']) < 180:
+            pending_phone = phone
+            session_data = data
+            break
+    
+    if not pending_phone:
+        return await message.reply("❌ **No active phone!** Send phone first.")
+    
+    session_name = session_data['session_name']
     session_path = f"{SESSION_DIR}/{session_name}"
     
-    await send_notification(chat_id, f"Session: `{phone}`", "start")
+    del bot.pending_sessions[pending_phone]
+    bot.waiting_2fa[pending_phone] = user_id
     
     try:
-        client = Client(session_path, api_id=API_ID, api_hash=API_HASH, phone_number=phone)
-        await client.start()
-        me = await client.get_me()
+        await message.reply(f"🔄 **Verifying `{pending_phone}`...**")
         
+        # Create temp client
+        temp_client = Client(session_path, api_id=API_ID, api_hash=API_HASH, phone_number=pending_phone)
+        await temp_client.connect()
+        
+        # Send code (real flow)
+        sent_code = await temp_client.send_code(pending_phone)
+        
+        # Sign in
+        await temp_client.sign_in(
+            phone=pending_phone,
+            phone_code_hash=sent_code.phone_code_hash,
+            phone_code=code
+        )
+        
+        # Success!
+        me = await temp_client.get_me()
         is_premium = getattr(me, 'is_premium', False)
-        premium_status = "💎 PREMIUM" if is_premium else "📱 Normal"
         
+        # Store session
         bot.sessions[session_name] = {
-            'phone': phone, 'user_id': me.id, 'username': me.username or '',
-            'first_name': me.first_name, 'is_premium': is_premium,
-            'path': session_path, 'active': True
+            'phone': pending_phone,
+            'user_id': me.id,
+            'username': getattr(me, 'username', None) or '',
+            'first_name': getattr(me, 'first_name', '') or '',
+            'is_premium': is_premium,
+            'path': session_path,
+            'active': True,
+            'created': int(time.time())
         }
         
         await bot.save_sessions()
-        await client.stop()
+        await temp_client.disconnect()
         
-        await send_notification(chat_id, f"✅ `{phone}` Added", "success",
-                               f"{premium_status}\nTotal: `{len(bot.sessions)}`")
-        return True
-    except Exception as e:
-        await send_notification(chat_id, f"❌ `{phone}` Failed", "progress", f"Error: {str(e)}")
-        return False
-
-# 💥 ENHANCED MASS ATTACK (5-10 sessions = 200-500+ reports!)
-async def mass_attack(target_id: int, target_type: str, chat_id: int, session_limit=250):
-    attack_id = f"{chat_id}_{int(time.time())}"
-    bot.active_attacks[attack_id] = {'progress': 0, 'total': 0}
-    
-    await send_notification(chat_id, f"🎯 {target_type.upper()} Attack", "start", 
-                           f"Target ID: `{target_id}`\n⚡ **Enhanced Multi-Report**")
-    
-    success_reports = 0
-    sessions = list(bot.sessions.values())[:session_limit]
-    bot.active_attacks[attack_id]['total'] = len(sessions)
-    
-    report_variants = [
-        ('Violence', 'Violence and dangerous organisations'), ('Child Abuse', 'Child abuse'),
-        ('Terrorism', 'Terrorism'), ('Pornography', 'Pornography'), ('Copyright', 'Copyright infringement'),
-        ('Spam', 'Spam'), ('Scam', 'Scam'), ('Fake', 'Fake account'), ('Impersonation', 'Impersonation'),
-        ('Harassment', 'Harassment'), ('Fake', 'Fake messages'), ('Violence', 'Violent messages'),
-        ('Spam', 'Spam messages'), ('Pornography', 'Pornographic content'), ('Copyright', 'Copyright violation'),
-    ]
-    
-    for i, session_info in enumerate(sessions):
-        session_path = session_info['path']
-        try:
-            client = Client(session_path, api_id=API_ID, api_hash=API_HASH)
-            await client.start()
-            session_reports = 0
-            
-            # PHASE 1: Peer/Chat Reports
-            for reason, _ in report_variants[:10]:
-                try:
-                    if target_type == 'user':
-                        await client.report_peer(target_id, reason)
-                    else:
-                        await client.report_chat(target_id, reason)
-                    session_reports += 1
-                    success_reports += 1
-                    await asyncio.sleep(random.uniform(0.1, 0.3))
-                except FloodWait as e:
-                    await asyncio.sleep(e.value + 1)
-                except:
-                    pass
-            
-            # PHASE 2: Message Reports
-            try:
-                async for msg in client.get_chat_history(target_id, limit=20):
-                    for reason in ['Violence', 'Spam', 'Fake', 'Pornography']:
-                        try:
-                            await client.report_message(target_id, msg.id, reason)
-                            session_reports += 1
-                            success_reports += 1
-                            await asyncio.sleep(0.05)
-                        except:
-                            break
-            except:
-                pass
-            
-            await client.stop()
-            bot.active_attacks[attack_id]['progress'] = i + 1
-            
-            progress_pct = f"{(i+1)*100//len(sessions)}%"
-            await send_notification(chat_id, f"⚡ Session {i+1}", "progress", 
-                                  f"`{session_reports}` reports | `{progress_pct}`")
-            
-            await asyncio.sleep(random.uniform(0.5, 1.5))
-            
-        except:
-            continue
-    
-    impact_score = "💀 **CRITICAL**" if success_reports >= 100 else "❄️ **HIGH**" if success_reports >= 50 else "🔥 **MEDIUM**"
-    status_msg = f"{impact_score}\n⚡ `{success_reports}` TOTAL reports\n📱 `{len(sessions)}` sessions\n⏱️ `{time.strftime('%H:%M:%S')}`"
-    
-    await send_notification(chat_id, "🎯 **ATTACK COMPLETED!**", "success", status_msg)
-    del bot.active_attacks[attack_id]
-
-# 🎯 HANDLERS
-@app.on_message(filters.command("start") & filters.private)
-async def start(client, message):
-    user_id = message.from_user.id
-    if user_id not in (OWNER_ID, *bot.sudos):
-        await message.reply("🔒 **@Smaugxd Exclusive Bot**")
-        return
-    
-    welcome = """👑 **Premium Killer Bot**
-💎 **DEVELOPER: @Smaugxd**
-
-⚡ LIVE notifications (5-10 sessions = 200-500+ reports!)
-✅ Username/ID ban  
-📢 Channel deletion
-❄️ Premium freeze
-
-**Status**: Online"""
-    
-    await message.reply(welcome, reply_markup=get_main_keyboard(), parse_mode=ParseMode.MARKDOWN)
-
-@app.on_message(filters.command("addsudo") & filters.private)
-async def add_sudo(client, message):
-    if message.from_user.id != OWNER_ID: return
-    try:
-        sudo_id = int(message.text.split()[1])
-        bot.sudos.add(sudo_id)
-        await bot.save_sudos()
-        await message.reply(f"✅ **Sudo Added**: `{sudo_id}`")
-    except:
-        await message.reply("❌ `/addsudo 123456789`")
-
-@app.on_callback_query()
-async def callbacks(client, callback):
-    user_id = callback.from_user.id
-    if user_id not in (OWNER_ID, *bot.sudos):
-        await callback.answer("🔒 Owner only!", show_alert=True)
-        return
-    
-    data = callback.data
-    if data == "add_session":
-        await callback.message.edit_text(f"📱 **Add Session**\n\nSend phone:\n`+1234567890`\n\n`{len(bot.sessions)}` active", parse_mode=ParseMode.MARKDOWN)
-    elif data == "ban_username":
-        await callback.message.edit_text("👤 **Username Attack**\n\nSend `@username`:")
-    elif data == "ban_id":
-        await callback.message.edit_text("🆔 **ID Attack**\n\nSend `user_id`:")
-    elif data == "delete_channel":
-        await callback.message.edit_text("📢 **Channel Delete**\n\nSend `@channel` or `ID`:")
-    elif data == "delete_group":
-        await callback.message.edit_text("👥 **Group Delete**\n\nSend group ID:")
-    elif data == "premium_kill":
-        await callback.message.edit_text("💎 **Premium Killer**\n\nSend target username/ID:")
-    elif data == "stats":
-        premium_count = sum(1 for s in bot.sessions.values() if s.get('is_premium'))
-        await callback.message.edit_text(f"📊 **Stats**\n💎 Premium: `{premium_count}`\n📱 Total: `{len(bot.sessions)}`\n⚡ Attacks: `{len(bot.active_attacks)}`", parse_mode=ParseMode.MARKDOWN)
-    
-    await callback.answer()
-
-@app.on_message(filters.private & filters.regex(r'^\+[1-9]\d{1,14}$'))
-async def phone_handler(client, message):
-    await create_session(message.text.strip(), message.chat.id)
-
-@app.on_message(filters.private & filters.text & ~filters.regex(r'^\+[1-9]\d{1,14}$'))
-async def target_handler(client, message):
-    user_id = message.from_user.id
-    if user_id not in (OWNER_ID, *bot.sudos): return
-    
-    target = message.text.strip()
-    session_count = min(len(bot.sessions), 250)
-    
-    await message.reply(f"🚀 **Attack Launched!**\n🎯 `{target}`\n📱 `{session_count}` sessions\n⚡ **50+ reports/session**\n📱 Check notifications!")
-    
-    # Parse target
-    try:
-        if target.startswith('@'):
-            entity = await app.resolve_peer(target)
-            target_id = entity.user.id if hasattr(entity, 'user') else entity.chat.id
-            target_type = 'user' if hasattr(entity, 'user') else 'channel'
-        else:
-            target_id = int(target)
-            target_type = 'user'
+        del bot.waiting_2fa[pending_phone]
         
-        asyncio.create_task(mass_attack(target_id, target_type, message.chat.id, session_count))
+        status = "💎 PREMIUM" if is_premium else "📱 Normal"
+        await message.reply(
+            f"✅ **Session Created Successfully!**\n\n"
+            f"📱 `{pending_phone}`\n"
+            f"👤 `{me.first_name}`\n"
+            f"🆔 `{me.id}`\n"
+            f"{status}\n\n"
+            f"📊 **Total:** `{len(bot.sessions)}`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+    except errors.SessionPasswordNeeded:
+        await message.reply(
+            f"🔐 **2FA Enabled on `{pending_phone}`!**\n\n"
+            f"🔑 **Step 2/3 - Send 2FA Password:**\n"
+            f"`yourpassword123`\n\n"
+            f"⏰ **Timeout:** 2 minutes\n"
+            f"💡 **Example:** `mypassword456`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+    except errors.PhoneCodeInvalid:
+        await message.reply("❌ **Invalid OTP!**\n📱 Send phone number again.")
+        if pending_phone in bot.waiting_2fa:
+            del bot.waiting_2fa[pending_phone]
+            
     except Exception as e:
-        await message.reply(f"❌ Error: `{str(e)[:50]}`")
+        await message.reply(f"❌ **Error:** `{str(e)[:100]}`\nTry again!")
+        if pending_phone in bot.waiting_2fa:
+            del bot.waiting_2fa[pending_phone]
+
+@bot.app.on_message(filters.private & filters.text & ~filters.regex(r'^\d{5,6}$') & ~filters.regex(r'^\+[1-9]\d{1,14}$') & ~filters.command("start"))
+async def password_handler(client: Client, message: Message):
+    password = message.text.strip()
+    user_id = message.from_user.id
+    
+    # Find pending 2FA
+    pending_phone = None
+    for phone, waiting_user in list(bot.waiting_2fa.items()):
+        if waiting_user == user_id:
+            pending_phone = phone
+            break
+    
+    if not pending_phone:
+        return  # Ignore non-2FA messages
+    
+    del bot.waiting_2fa[pending_phone]
+    
+    session_name = None
+    for name, data in bot.pending_sessions.items():
+        if data.get('phone') == pending_phone:
+            session_name = data['session_name']
+            break
+    
+    if not session_name:
+        return await message.reply("❌ **Session expired!** Send phone again.")
+    
+    session_path = f"{SESSION_DIR}/{session_name}"
+    
+    try:
+        await message.reply(f"🔓 **Unlocking 2FA** `{password[:3]}***` for `{pending_phone}`...")
+        
+        # Create client for 2FA
+        temp_client = Client(session_path, api_id=API_ID, api_hash=API_HASH, phone_number=pending_phone)
+        await temp_client.connect()
+        
+        # Send code again for fresh hash
+        sent_code = await temp_client.send_code(pending_phone)
+        
+        # Sign in with dummy code + password
+        await temp_client.sign_in(
+            phone=pending_phone,
+            phone_code_hash=sent_code.phone_code_hash,
+            phone_code="00000",  # Triggers password prompt
+            password=password
+        )
+        
+        # Success!
+        me = await temp_client.get_me()
+        is_premium = getattr(me, 'is_premium', False)
+        
+        bot.sessions[session_name] = {
+            'phone': pending_phone,
+            'user_id': me.id,
+            'username': getattr(me, 'username', None) or '',
+            'first_name': getattr(me, 'first_name', '') or '',
+            'is_premium': is_premium,
+            'path': session_path,
+            'active': True,
+            'created': int(time.time())
+        }
+        
+        await bot.save_sessions()
+        await temp_client.disconnect()
+        
+        status = "💎 PREMIUM" if is_premium else "📱 Normal"
+        await message.reply(
+            f"✅ **2FA Session Created!** 🎉\n\n"
+            f"📱 `{pending_phone}`\n"
+            f"👤 `{me.first_name}`\n"
+            f"🆔 `{me.id}`\n"
+            f"{status}\n"
+            f"🔐 **Password:** `{password[:3]}***`\n\n"
+            f"📊 **Total:** `{len(bot.sessions)}`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+    except Exception as e:
+        await message.reply(f"❌ **2FA Failed:** `{str(e)[:100]}`\n🔐 Try correct password!")
+        bot.waiting_2fa[pending_phone] = user_id  # Retry
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🚀 START BOT
+# ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    print("🚀 Premium Killer Bot Started | @Smaugxd")
-    app.run()
+    # Edit CONFIG above 👆
+    asyncio.run(bot.start())
